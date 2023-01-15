@@ -10,15 +10,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  linux-arm:
+    name: test
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-    - name: rust-cargo
-    - uses: actions-rs/toolchain@v1
-      with:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
           toolchain: stable
-    - uses: actions-rs/cargo@v1.0.1
-    - run:  cargo build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=geph4-client/Cargo.toml
+      - uses: actions-rs/cargo@v1
+        with:
+          use-cross: true
+          command: build
+          args: build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=geph4-client/Cargo.toml
+          
+          
