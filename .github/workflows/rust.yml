@@ -16,5 +16,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Build
-      run: build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=geph4-client/Cargo.toml
+    - name: rust-cargo
+    - uses: actions-rs/toolchain@v1
+      with:
+          toolchain: stable
+    - uses: actions-rs/cargo@v1.0.1
+    - run:  cargo build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=geph4-client/Cargo.toml
