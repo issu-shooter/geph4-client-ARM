@@ -19,10 +19,8 @@ jobs:
         with:
           toolchain: stable
           target: aarch64-unknown-linux-gnu
-      - uses: actions-rs/cargo@v1
+      - uses: actions-rs/cargo@v1.0.1
         with:
           use-cross: true
           command: build
-          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=/geph4-flatpak-ARM/Cargo.toml
-          
-          
+          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=geph4FA.toml
