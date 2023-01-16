@@ -23,6 +23,6 @@ jobs:
         with:
           use-cross: true
           command: build
-          args: --release --locked --target aarch64-unknown-linux-gnu
+          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=/geph4-flatpak-ARM/Cargo.toml
           
           
