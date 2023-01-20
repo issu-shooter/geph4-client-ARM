@@ -24,8 +24,8 @@ jobs:
           use-cross: true
           command: build
           args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /tmp/geph4_build
-      - uses: actions/upload-artifact@v3
       - name: export binaries
+      - uses: actions/upload-artifact@v3
         with:
           name: Geph4-aarch64
           path: /tmp/geph4_build/project/target/release
