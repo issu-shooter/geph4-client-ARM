@@ -27,11 +27,11 @@ jobs:
         with:
           use-cross: true
           command: build
-          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /tmp/geph4_build
+          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
         
       - name: tar the binary
         run: |
-         export PROGRAM=/tmp/geph4_build
+         export PROGRAM=/home/runner/gephy
          tar -cavf geph4arm.tar.gz $PROGRAM
         
       - name: uploading artifacts
