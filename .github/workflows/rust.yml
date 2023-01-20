@@ -29,7 +29,7 @@ jobs:
         with:
          use-cross: true
          command: build
-         arg: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
+         args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
         
       - name: tar the binary
         run: |
