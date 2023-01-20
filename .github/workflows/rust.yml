@@ -11,20 +11,38 @@ env:
 
 jobs:
   linux-arm:
-    name: test
+    name: basic building
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
+      
+      - name: basics
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           target: aarch64-unknown-linux-gnu
-      - uses: actions-rs/cargo@v1.0.1
+          
+      - name: compiling
+        uses: actions-rs/cargo@v1.0.1
         with:
           use-cross: true
           command: build
-          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /tmp/geph4_build
-      - uses: actions/upload-artifact@v3
+          args: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/work/geph4FA/geph4_build
+        
+      - name: tar the binary
+        run: |
+         export PROGRAM=geph4_build
+         cp `stack exec -- which $PROGRAM` $PROGRAM
+         tar -cavf geph4arm.tar.gz $PROGRAM
+        
+      - name: uploading artifacts
+        id: upload-release-asset 
+        uses: actions/upload-release-asset@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: Geph4-aarch64
-          path: /tmp/geph4_build/project/target/release
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./geph4arm.tar.gz
+          asset_name: program-${{ runner.os }}.tar.gz
+          asset_content_type: application/tar.gz
+  
