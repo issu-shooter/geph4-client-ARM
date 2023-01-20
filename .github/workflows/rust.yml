@@ -21,9 +21,15 @@ jobs:
         with:
           toolchain: stable
           target: aarch64-unknown-linux-gnu
+      - name: super
+        run: sudo su
           
       - name: compiling
-        run: sudo cargo cross build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
+        uses: actions-rs/cargo@v1
+        with:
+         use-cross: true
+         command: build
+         arg: --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
         
       - name: tar the binary
         run: |
