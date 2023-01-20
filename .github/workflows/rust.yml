@@ -23,7 +23,7 @@ jobs:
           target: aarch64-unknown-linux-gnu
           
       - name: compiling
-        run: sudo cross build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
+        run: sudo cargo cross build --release --locked --target aarch64-unknown-linux-gnu --manifest-path=Cargo.toml --target-dir /home/runner/gephy
         
       - name: tar the binary
         run: |
