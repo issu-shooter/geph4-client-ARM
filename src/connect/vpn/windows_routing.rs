@@ -1,14 +1,14 @@
+use crate::config::CacheStaleGuard;
+use crate::connect::tunnel::TunnelStatus;
+use dashmap::DashSet;
+use once_cell::sync::Lazy;
+use pnet_packet::{ip::IpNextHeaderProtocols, MutablePacket};
+use std::net::{IpAddr, Ipv4Addr};
 use std::{
     convert::Infallible,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
-
-use crate::tunnel::TunnelStatus;
-use async_net::{IpAddr, Ipv4Addr};
-use dashmap::DashSet;
-use once_cell::sync::Lazy;
-use pnet_packet::{ip::IpNextHeaderProtocols, MutablePacket};
 
 use crate::connect::{vpn::vpn_upload, TUNNEL, TUNNEL_STATUS_CALLBACK};
 
@@ -31,6 +31,8 @@ pub fn start_routing() -> Infallible {
         log::debug!("waiting for tunnel to connect first...");
         std::thread::sleep(Duration::from_secs(1));
     }
+
+    let _stale_guard = CacheStaleGuard::new();
 
     std::thread::spawn(upload_loop);
     download_loop()
@@ -67,9 +69,6 @@ fn upload_loop() {
         let pkt = handle.receive();
         match pkt {
             Ok(mut pkt) => {
-                if pkt.len() > 1300 {
-                    continue;
-                }
                 let pkt_dest: Option<Ipv4Addr> =
                     pnet_packet::ipv4::Ipv4Packet::new(&pkt).map(|parsed| parsed.get_destination());
                 if let Some(pkt_dest) = pkt_dest {

@@ -16,7 +16,7 @@ pub struct SyncOpt {
 
     /// Forces synchronization of fresh data.
     #[structopt(long)]
-    force: bool,
+    pub force: bool,
 }
 
 pub async fn main_sync(opt: SyncOpt) -> anyhow::Result<()> {
@@ -28,7 +28,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn sync_json(opt: SyncOpt) -> anyhow::Result<String> {
     if opt.force {
         // clear the entire directory, baby!
-        let _ = std::fs::remove_dir_all(&opt.auth.credential_cache);
+        for _ in 0..100 {
+            let _ = std::fs::remove_dir_all(&opt.auth.credential_cache);
+        }
+        // anyhow::bail!("oh")
     }
 
     let binder_client = get_cached_binder_client(&opt.common, &opt.auth)?;
@@ -50,6 +53,7 @@ pub async fn sync_json(opt: SyncOpt) -> anyhow::Result<String> {
                     Level::Plus => "plus".to_string(),
                 })
                 .collect_vec(),
+            load: exit.load,
         })
         .collect_vec();
     Ok(format!(
@@ -67,4 +71,5 @@ struct DumbedDownExitDescriptor {
     country_code: String,
     city_code: String,
     allowed_levels: Vec<String>,
+    load: f64,
 }

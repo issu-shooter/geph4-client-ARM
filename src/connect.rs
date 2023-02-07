@@ -10,13 +10,11 @@ use once_cell::sync::Lazy;
 
 use parking_lot::RwLock;
 use smol::{prelude::*, Task};
+use smol_timeout::TimeoutExt;
 
 use crate::{
     config::{get_cached_binder_client, ConnectOpt, Opt, CONFIG},
-    tunnel::{
-        activity::wait_activity, BinderTunnelParams, ClientTunnel, ConnectionOptions,
-        EndpointSource, TunnelStatus,
-    },
+    connect::tunnel::{BinderTunnelParams, ClientTunnel, EndpointSource, TunnelStatus},
 };
 
 use crate::china;
@@ -25,6 +23,7 @@ mod dns;
 mod port_forwarder;
 mod socks5;
 mod stats;
+mod tunnel;
 pub(crate) mod vpn;
 
 /// Main function for `connect` subcommand
@@ -51,16 +50,15 @@ static CONNECT_CONFIG: Lazy<ConnectOpt> = Lazy::new(|| match CONFIG.deref() {
 static SHOULD_USE_BRIDGES: Lazy<bool> = Lazy::new(|| {
     smol::future::block_on(async {
         // Test china
-        let is_china = test_china().await;
+        let is_china = test_china().timeout(Duration::from_secs(2)).await;
         match is_china {
-            Err(e) => {
+            Some(Err(_)) | None => {
                 log::warn!(
-                    "could not tell whether or not we're in China ({}), so assuming that we are!",
-                    e
+                    "could not tell whether or not we're in China , so assuming that we are!",
                 );
                 true
             }
-            Ok(true) => {
+            Some(Ok(true)) => {
                 log::info!("we are in CHINA :O");
                 true
             }
@@ -91,47 +89,25 @@ pub static TUNNEL: Lazy<ClientTunnel> = Lazy::new(|| {
                 exit_server: CONNECT_CONFIG.exit_server.clone(),
                 use_bridges: *SHOULD_USE_BRIDGES,
                 force_bridge: CONNECT_CONFIG.force_bridge,
+                force_protocol: CONNECT_CONFIG.force_protocol.clone(),
             })
         }
     };
     log::debug!("gonna construct the tunnel");
-    ClientTunnel::new(
-        ConnectionOptions {
-            udp_shard_count: CONNECT_CONFIG.udp_shard_count,
-            udp_shard_lifetime: CONNECT_CONFIG.udp_shard_lifetime,
-            tcp_shard_count: CONNECT_CONFIG.tcp_shard_count,
-            tcp_shard_lifetime: CONNECT_CONFIG.tcp_shard_lifetime,
-            use_tcp: CONNECT_CONFIG.use_tcp,
-        },
-        endpoint,
-        |status| TUNNEL_STATUS_CALLBACK.read()(status),
-    )
+    ClientTunnel::new(endpoint, |status| TUNNEL_STATUS_CALLBACK.read()(status))
 });
 
 static CONNECT_TASK: Lazy<Task<Infallible>> = Lazy::new(|| {
-    /// Prints stats in a loop.
-    async fn print_stats_loop() {
-        loop {
-            wait_activity(Duration::from_secs(200)).await;
-            let stats = TUNNEL.get_stats().await;
-            log::info!("** recv_loss = {:.2}% **", stats.last_loss * 100.0);
-            smol::Timer::after(Duration::from_secs(30)).await;
-        }
-    }
-
     smolscale::spawn(async {
         // print out config file
         log::info!(
-            "connect mode starting: exit = {:?}, use_tcp = {}, use_bridges = {}",
+            "connect mode starting: exit = {:?}, force_protocol = {:?}, use_bridges = {}",
             CONNECT_CONFIG.exit_server,
-            CONNECT_CONFIG.use_tcp,
+            CONNECT_CONFIG.force_protocol,
             CONNECT_CONFIG.use_bridges
         );
         smol::Timer::after(Duration::from_secs(1)).await;
-        let stats_printer_fut = async {
-            print_stats_loop().await;
-            Ok(())
-        };
+
         // http proxy
         let _socks2h = smolscale::spawn(Compat::new(crate::socks2http::run_tokio(
             CONNECT_CONFIG.http_listen,
@@ -162,35 +138,9 @@ static CONNECT_TASK: Lazy<Task<Infallible>> = Lazy::new(|| {
 
         Lazy::force(&stats::STATS_THREAD);
 
-        let _syncer = smolscale::spawn(async {
-            // We must keep our stuff freshly cached so that when Geph dies and respawns, it never needs to talk to the binder again.
-            loop {
-                smol::Timer::after(Duration::from_secs(120)).await;
-                let s = match TUNNEL.get_endpoint() {
-                    EndpointSource::Independent { .. } => return,
-                    EndpointSource::Binder(b) => {
-                        CACHED_BINDER_CLIENT
-                            .get_closest_exit(&b.exit_server.unwrap_or_default())
-                            .await
-                    }
-                };
-                if let Ok(s) = s {
-                    if let Err(err) = CACHED_BINDER_CLIENT.get_bridges(&s.hostname, true).await {
-                        log::warn!("error refreshing bridges: {:?}", err);
-                    } else {
-                        log::debug!("refreshed bridges");
-                    }
-                }
-            }
-        });
-
         // ready, set, go!
         Lazy::force(&vpn::VPN_SHUFFLE_TASK);
-        stats_printer_fut
-            .race(socks5_fut)
-            .race(dns_fut)
-            .await
-            .unwrap();
+        socks5_fut.race(dns_fut).await.unwrap();
         panic!("something died")
     })
 });

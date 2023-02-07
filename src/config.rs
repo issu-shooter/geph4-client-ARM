@@ -1,16 +1,18 @@
 use std::{
     path::PathBuf,
     str::FromStr,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::fronts::parse_fronts;
-use async_net::{Ipv4Addr, SocketAddr};
 use bytes::Bytes;
 use geph4_protocol::binder::client::{CachedBinderClient, DynBinderClient};
 use geph4_protocol::binder::protocol::BinderClient;
 use once_cell::sync::{Lazy, OnceCell};
+
 use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, SocketAddr};
 use structopt::StructOpt;
 
 static INIT_CONFIG: OnceCell<Opt> = OnceCell::new();
@@ -30,6 +32,7 @@ pub enum Opt {
     BridgeTest(crate::main_bridgetest::BridgeTestOpt),
     Sync(crate::sync::SyncOpt),
     BinderProxy(crate::binderproxy::BinderProxyOpt),
+    Debugpack(crate::debugpack::DebugPackOpt),
 }
 
 #[derive(Debug, StructOpt, Clone, Deserialize, Serialize)]
@@ -108,8 +111,8 @@ pub struct ConnectOpt {
     pub vpn_mode: Option<VpnMode>,
 
     #[structopt(long)]
-    /// Whether or not to force TCP mode.
-    pub use_tcp: bool,
+    /// Forces the protocol selected to match the given regex.
+    pub force_protocol: Option<String>,
 
     #[structopt(long)]
     /// SSH-style local-remote port forwarding. For example, "0.0.0.0:8888:::example.com:22" will forward local port 8888 to example.com:22. Must be in form host:port:::host:port! May have multiple ones.
@@ -145,14 +148,14 @@ impl FromStr for VpnMode {
 pub struct CommonOpt {
     #[structopt(
         long,
-        default_value = "https://www.netlify.com/v4/next-gen,https://www.cdn77.com/next-gen,https://ajax.aspnetcdn.com/next-gen,https://d1hoqe10mv32pv.cloudfront.net/next-gen"
+        default_value = "https://www.netlify.com/v4/next-gen,https://vuejs.org/v4/next-gen,https://www.cdn77.com/next-gen,https://ajax.aspnetcdn.com/next-gen,https://dtnins2n354c4.cloudfront.net/v4/next-gen"
     )]
     /// HTTP(S) address of the binder, FRONTED
     binder_http_fronts: String,
 
     #[structopt(
         long,
-        default_value = "svitania-naidallszei.netlify.app,1049933718.rsc.cdn77.org,gephbinder-4.azureedge.net,dtnins2n354c4.cloudfront.net"
+        default_value = "svitania-naidallszei.netlify.app,svitania-naidallszei.netlify.app,1049933718.rsc.cdn77.org,gephbinder-4.azureedge.net,dtnins2n354c4.cloudfront.net"
     )]
     /// HTTP(S) actual host of the binder
     binder_http_hosts: String,
@@ -180,6 +183,9 @@ pub struct CommonOpt {
     )]
     /// mizaru master key of the binder, for PLUS
     binder_mizaru_plus: mizaru::PublicKey,
+
+    #[structopt(long, default_value = "file::memory:?cache=shared")]
+    pub debugpack_path: String,
 }
 
 impl CommonOpt {
@@ -237,6 +243,28 @@ fn str_to_mizaru_pk(src: &str) -> mizaru::PublicKey {
     mizaru::PublicKey(raw_bts)
 }
 
+/// If greater than zero, then cache can be stale.
+static CACHE_STALELOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Keep this alive to allow the cache to be stale.
+#[non_exhaustive]
+pub struct CacheStaleGuard {}
+
+impl Drop for CacheStaleGuard {
+    fn drop(&mut self) {
+        let lc = CACHE_STALELOCK_COUNT.fetch_sub(1, Ordering::SeqCst);
+        log::debug!("lockcount decr {lc}");
+    }
+}
+
+impl CacheStaleGuard {
+    pub fn new() -> Self {
+        let lc = CACHE_STALELOCK_COUNT.fetch_add(1, Ordering::SeqCst);
+        log::debug!("lockcount incr {lc}");
+        Self {}
+    }
+}
+
 /// Given the common and authentication options, produce a binder client.
 pub fn get_cached_binder_client(
     common_opt: &CommonOpt,
@@ -261,7 +289,9 @@ pub fn get_cached_binder_client(
                 dbpath.push(format!("{}.json", key));
                 let r = std::fs::read(dbpath).ok()?;
                 let (tstamp, bts): (u64, Bytes) = bincode::deserialize(&r).ok()?;
-                if tstamp > SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() {
+                if tstamp > SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()
+                    || CACHE_STALELOCK_COUNT.load(Ordering::SeqCst) > 0
+                {
                     Some(bts)
                 } else {
                     None

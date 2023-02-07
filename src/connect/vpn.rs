@@ -23,10 +23,10 @@ use std::os::unix::prelude::{AsRawFd, FromRawFd};
 
 use anyhow::Context;
 
-use async_net::Ipv4Addr;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use geph4_protocol::VpnMessage;
+use std::net::Ipv4Addr;
+
 use geph_nat::GephNat;
 use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
@@ -39,9 +39,9 @@ use pnet_packet::{
 };
 use smol::prelude::*;
 
-use crate::config::VpnMode;
+use crate::{config::VpnMode, connect::stats::STATS_RECV_BYTES};
 
-use super::{CONNECT_CONFIG, TUNNEL};
+use super::{stats::STATS_SEND_BYTES, CONNECT_CONFIG, TUNNEL};
 
 /// The VPN shuffling task
 pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
@@ -53,7 +53,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
         let up_thread = std::thread::Builder::new()
             .name("vpn-up".into())
             .spawn(move || {
-                let mut bts = [0u8; 2048];
+                let mut bts = [0u8; 65536];
                 loop {
                     let n = up_file.read(&mut bts).expect("vpn up thread failed");
 
@@ -76,7 +76,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
                 log::trace!("vpn dn {}", bts.len());
                 #[cfg(target_os = "macos")]
                 {
-                    let mut buf = [0u8; 4096];
+                    let mut buf = [0u8; 65536];
                     buf[4..][..bts.len()].copy_from_slice(&bts);
                     buf[3] = 0x02;
                     let _ = down_file.write(&buf[..bts.len() + 4]);
@@ -140,7 +140,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
                         let device = {
                             use tun::Device;
                             let device = ::tun::platform::Device::new(
-                                ::tun::Configuration::default().mtu(1280).up(),
+                                ::tun::Configuration::default().mtu(16384).up(),
                             )
                             .expect("could not initialize TUN device");
                             std::process::Command::new("ifconfig")
@@ -161,7 +161,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
                                 .address("100.64.89.64")
                                 .netmask("255.255.255.0")
                                 .destination("100.64.0.1")
-                                .mtu(1280)
+                                .mtu(16384)
                                 .up(),
                         )
                         .expect("could not initialize TUN device");
@@ -196,6 +196,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
                 }
                 None => {
                     log::info!("not starting VPN mode");
+                    Lazy::force(&TUNNEL);
                     loop {
                         std::thread::park()
                     }
@@ -208,6 +209,7 @@ pub static VPN_SHUFFLE_TASK: Lazy<JoinHandle<Infallible>> = Lazy::new(|| {
 /// Uploads a packet through the global VPN
 pub fn vpn_upload(pkt: Bytes) {
     Lazy::force(&VPN_TASK);
+    STATS_SEND_BYTES.fetch_add(pkt.len() as u64, Ordering::Relaxed);
     let _ = UP_CHANNEL.0.try_send(pkt);
 }
 
@@ -215,44 +217,53 @@ pub fn vpn_upload(pkt: Bytes) {
 pub async fn vpn_download() -> Bytes {
     log::trace!("called vpn_download");
     Lazy::force(&VPN_TASK);
-    DOWN_CHANNEL.1.recv_async().await.unwrap()
+    let pkt = DOWN_CHANNEL.1.recv_async().await.unwrap();
+    STATS_RECV_BYTES.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+    pkt
 }
 
 /// Downloads a packet through the global VPN, blockingly
 pub fn vpn_download_blocking() -> Bytes {
     Lazy::force(&VPN_TASK);
-    DOWN_CHANNEL.1.recv().unwrap()
+    let pkt = DOWN_CHANNEL.1.recv().unwrap();
+    STATS_RECV_BYTES.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+    pkt
 }
 
 // Up and down channels
 static UP_CHANNEL: Lazy<(flume::Sender<Bytes>, flume::Receiver<Bytes>)> =
-    Lazy::new(|| flume::bounded(100));
+    Lazy::new(|| flume::bounded(10000));
 static DOWN_CHANNEL: Lazy<(flume::Sender<Bytes>, flume::Receiver<Bytes>)> =
-    Lazy::new(|| flume::bounded(100));
+    Lazy::new(|| flume::bounded(10000));
 
-static VPN_TASK: Lazy<smol::Task<Infallible>> = Lazy::new(|| {
-    smolscale::spawn(async {
-        loop {
-            smol::Timer::after(Duration::from_secs(10)).await;
-            let init_ip = TUNNEL.get_vpn_client_ip().await;
-            let nat = Arc::new(GephNat::new(
-                NAT_TABLE_SIZE,
-                TUNNEL.get_vpn_client_ip().await,
-            ));
-            let ip_change_fut = async move {
+static VPN_TASK: Lazy<std::thread::JoinHandle<()>> = Lazy::new(|| {
+    std::thread::spawn(|| {
+        match std::panic::catch_unwind(|| {
+            smol::future::block_on(async {
                 loop {
-                    let i = TUNNEL.get_vpn_client_ip().await;
-                    if i != init_ip {
-                        anyhow::bail!("new IP: {i}")
-                    }
-                    smol::Timer::after(Duration::from_secs(5)).await;
+                    log::info!("VPN task about to get client IP...");
+                    let init_ip = TUNNEL.get_vpn_client_ip().await;
+                    log::info!("VPN task initializing IP to {init_ip}");
+                    let nat = Arc::new(GephNat::new(NAT_TABLE_SIZE, init_ip));
+                    let ip_change_fut = async move {
+                        loop {
+                            let i = TUNNEL.get_vpn_client_ip().await;
+                            if i != init_ip {
+                                anyhow::bail!("new IP: {i}")
+                            }
+                            smol::Timer::after(Duration::from_secs(5)).await;
+                        }
+                    };
+                    let res = vpn_up_loop(nat.clone())
+                        .or(vpn_down_loop(nat))
+                        .or(ip_change_fut)
+                        .await;
+                    log::warn!("vpn loops somehow died: {:?}", res);
                 }
-            };
-            let res = vpn_up_loop(nat.clone())
-                .or(vpn_down_loop(nat))
-                .or(ip_change_fut)
-                .await;
-            log::warn!("vpn loops somehow died: {:?}", res);
+            })
+        }) {
+            Ok(inner) => log::error!("VPN Task loop returned?!! {:?}", inner),
+            Err(e) => log::error!("VPN_TASK just panicked with {:?}", e),
         }
     })
 });
@@ -275,7 +286,7 @@ async fn vpn_up_loop(nat: Arc<GephNat>) -> anyhow::Result<()> {
             let mangled_msg = nat.mangle_upstream_pkt(&bts);
 
             if let Some(body) = mangled_msg {
-                TUNNEL.send_vpn(VpnMessage::Payload(body)).await? // will this question mark make the whole function return if something fails?
+                TUNNEL.send_vpn(body).await?
             };
         }
     }
@@ -352,20 +363,13 @@ fn fix_all_checksums(bts: &mut [u8]) -> Option<()> {
 
 /// Down loop for vpn
 async fn vpn_down_loop(nat: Arc<GephNat>) -> anyhow::Result<()> {
-    let mut count = 0u64;
     loop {
         let incoming = TUNNEL.recv_vpn().await.context("downstream failed")?;
-        count += 1;
-        if count % 1000 == 1 {
-            log::debug!("VPN received {} pkts ", count);
-        }
-        if let geph4_protocol::VpnMessage::Payload(bts) = incoming {
-            let mangled_incoming = nat.mangle_downstream_pkt(&bts);
-            if let Some(mangled_bts) = mangled_incoming {
-                let mut mangled_bts = mangled_bts.to_vec();
-                mangle_dns_dn(&mut mangled_bts);
-                let _ = DOWN_CHANNEL.0.try_send(mangled_bts.into());
-            }
+        let mangled_incoming = nat.mangle_downstream_pkt(&incoming);
+        if let Some(mangled_bts) = mangled_incoming {
+            let mut mangled_bts = mangled_bts.to_vec();
+            mangle_dns_dn(&mut mangled_bts);
+            let _ = DOWN_CHANNEL.0.try_send(mangled_bts.into());
         }
     }
 }
