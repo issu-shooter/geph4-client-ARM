@@ -35,15 +35,8 @@ jobs:
         run: |
          export PROGRAM=/home/runner/gephy
          tar -cavf geph4arm.tar.gz $PROGRAM
-        
-      - name: uploading artifacts
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         
+      - uses: actions/upload-artifact@v3
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./geph4arm.tar.gz
-          asset_name: program-${{ runner.os }}.tar.gz
-          asset_content_type: application/tar.gz
-  
+          name: build-arm-artifact
+          path: /home/runner/gephy/geph4arm.tar.gz
