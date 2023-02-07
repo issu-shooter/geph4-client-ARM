@@ -35,8 +35,10 @@ jobs:
         run: |
          export PROGRAM=/home/runner/gephy
          tar -cavf geph4arm.tar.gz $PROGRAM
+      - name: test presence
+        run: ls /home/runner/gephy
          
       - uses: actions/upload-artifact@v3
         with:
           name: build-arm-artifact
-          path: /home/runner/gephy/geph4arm.tar.gz
+          path: /home/runner/gephy
