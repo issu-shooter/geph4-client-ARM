@@ -1,4 +1,4 @@
-# geph4-flatpak-ARM
+# geph4-flatpak-ARM64
 
 An attempt to automatically compile ARM version of geph using Github Actions, flatpak support is planned.
 
