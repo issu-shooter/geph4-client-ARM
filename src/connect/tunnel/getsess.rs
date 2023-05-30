@@ -1,8 +1,11 @@
+use bytes::Bytes;
+use ed25519_dalek::ed25519::signature::Signature;
+use ed25519_dalek::{PublicKey, Verifier};
 use futures_util::{stream::FuturesUnordered, Future, StreamExt};
 use geph4_protocol::binder::protocol::{BridgeDescriptor, ExitDescriptor};
 
 use itertools::Itertools;
-use native_tls::{Protocol, TlsConnector};
+use native_tls::TlsConnector;
 use rand::Rng;
 use regex::Regex;
 use smol_str::SmolStr;
@@ -13,7 +16,11 @@ use crate::connect::tunnel::{autoconnect::AutoconnectPipe, delay::DelayPipe, Tun
 
 use super::{BinderTunnelParams, EndpointSource, TunnelCtx};
 use anyhow::Context;
-use std::{collections::BTreeSet, net::SocketAddr, sync::Weak};
+use std::{
+    collections::{BTreeSet, HashSet},
+    net::SocketAddr,
+    sync::Weak,
+};
 
 use std::{convert::TryFrom, sync::Arc, time::Duration};
 
@@ -32,6 +39,34 @@ pub fn parse_independent_endpoint(endpoint: &str) -> anyhow::Result<(SocketAddr,
         .parse()
         .context("cannot parse host:port")?;
     Ok((server_addr, server_pk))
+}
+
+fn verify_exit_signatures(
+    bridges: &[BridgeDescriptor],
+    signing_key: PublicKey,
+) -> anyhow::Result<()> {
+    for b in bridges.iter() {
+        // The exit signed this bridge with an empty signature, so we have to verify with an empty signature
+        let mut clean_bridge = b.clone();
+        clean_bridge.exit_signature = Bytes::new();
+
+        let signature = &Signature::from_bytes(b.exit_signature.as_ref())
+            .context("failed to deserialize exit signature")?;
+        let bridge_msg = bincode::serialize(&clean_bridge).unwrap();
+        let bridge_log_id = format!("[{}] {}/{}", b.protocol, b.exit_hostname, b.endpoint);
+        match signing_key.verify(bridge_msg.as_slice(), signature) {
+            Ok(_) => {
+                log::debug!("successfully verified bridge signature for {bridge_log_id}");
+            }
+            Err(err) => {
+                anyhow::bail!(
+                    "failed to verify exit signature for {bridge_log_id}, error: {:?}",
+                    err
+                )
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn get_session(ctx: TunnelCtx) -> anyhow::Result<Arc<sosistab2::Multiplex>> {
@@ -77,29 +112,30 @@ pub(crate) async fn get_session(ctx: TunnelCtx) -> anyhow::Result<Arc<sosistab2:
             if bridges.is_empty() {
                 anyhow::bail!("no sosistab2 routes to {}", selected_exit.hostname)
             }
+
             log::debug!("{} routes", bridges.len());
-            // The bridge descriptor is laid out in a rather weird format: the "sosistab_key" field is a bincode-encode tuple of the first-level cookie, and the end-to-end MuxPublic key.
-            // we assume we have at least one obfsudp key
-            let e2e_key: MuxPublic = {
-                let mut seen = None;
-                for bridge in bridges.iter() {
-                    if bridge.protocol == "sosistab2-obfsudp" {
-                        if let Ok(val) =
-                            bincode::deserialize::<(ObfsUdpPublic, MuxPublic)>(&bridge.sosistab_key)
-                        {
-                            seen = Some(val.1)
-                        }
-                    }
-                }
-                seen.context("cannot deduce the sosistab2 MuxPublic of this exit")?
-            };
+
+            let e2e_key = MuxPublic::from_bytes(*selected_exit.sosistab_e2e_pk.as_bytes());
             let multiplex = Arc::new(sosistab2::Multiplex::new(
                 MuxSecret::generate(),
                 Some(e2e_key),
             ));
+
+            verify_exit_signatures(&bridges, selected_exit.signing_key)?;
+
             // add *all* the bridges!
             let sess_id = format!("sess-{}", rand::thread_rng().gen::<u128>());
-            add_bridges(&ctx, &sess_id, &multiplex, &bridges).await;
+            {
+                let ctx = ctx.clone();
+                let multiplex = multiplex.clone();
+                let sess_id = sess_id.clone();
+                smolscale::spawn(async move {
+                    add_bridges(&ctx, &sess_id, &multiplex, &bridges)
+                        .timeout(Duration::from_secs(30))
+                        .await;
+                })
+                .detach();
+            }
 
             // weak here to prevent a reference cycle!
             let weak_multiplex = Arc::downgrade(&multiplex);
@@ -145,18 +181,22 @@ async fn add_bridges(
                     }
                 }
                 uo.push(async {
-                    match connect_once(ctx.clone(), bridge.clone(), sess_id).await {
-                        Ok(pipe) => {
-                            log::debug!("add pipe {} / {}", pipe.protocol(), pipe.peer_addr());
-                            mplex.add_pipe(pipe);
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "pipe creation failed for {} ({}): {:?}",
-                                bridge.endpoint,
-                                bridge.protocol,
-                                err
-                            )
+                    for _ in 0..10 {
+                        match connect_once(ctx.clone(), bridge.clone(), sess_id).await {
+                            Ok(pipe) => {
+                                log::debug!("add pipe {} / {}", pipe.protocol(), pipe.peer_addr());
+                                mplex.add_pipe(pipe);
+                                return;
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "pipe creation failed for {} ({}): {:?}",
+                                    bridge.endpoint,
+                                    bridge.protocol,
+                                    err
+                                );
+                                smol::Timer::after(Duration::from_secs(1)).await;
+                            }
                         }
                     }
                 })
@@ -169,9 +209,9 @@ async fn add_bridges(
 }
 
 async fn connect_udp(desc: BridgeDescriptor, meta: String) -> anyhow::Result<ObfsUdpPipe> {
-    let keys: (ObfsUdpPublic, MuxPublic) =
-        bincode::deserialize(&desc.sosistab_key).context("cannot decode keys")?;
-    ObfsUdpPipe::connect(desc.endpoint, keys.0, &meta)
+    let cookie: ObfsUdpPublic =
+        bincode::deserialize(&desc.cookie).context("cannot decode pipe cookie")?;
+    ObfsUdpPipe::connect(desc.endpoint, cookie, &meta)
         .timeout(Duration::from_secs(10))
         .await
         .context("pipe connection timeout")?
@@ -190,7 +230,7 @@ async fn connect_tls(desc: BridgeDescriptor, meta: String) -> anyhow::Result<Obf
         desc.endpoint,
         &fake_domain,
         config,
-        desc.sosistab_key.clone(),
+        desc.cookie.clone(),
         &meta,
     )
     .timeout(Duration::from_secs(10))
@@ -249,18 +289,14 @@ async fn connect_once(
             let desc = desc.clone();
             Box::new(DelayPipe::new(
                 autoconnect_with(move || connect_tls(desc.clone(), meta.clone())).await?,
-                Duration::from_millis(50),
+                Duration::from_millis(20),
             ))
         }
         other => {
             anyhow::bail!("unknown protocol {other}")
         }
     };
-    if desc.is_direct {
-        Ok(inner)
-    } else {
-        Ok(Box::new(DelayPipe::new(inner, Duration::from_millis(10))))
-    }
+    Ok(inner)
 }
 
 async fn replace_dead(
@@ -273,21 +309,45 @@ async fn replace_dead(
     let ccache = binder_tunnel_params.ccache.clone();
     let mut previous_bridges: Option<Vec<BridgeDescriptor>> = None;
     loop {
-        smol::Timer::after(Duration::from_secs(300)).await;
+        smol::Timer::after(Duration::from_secs(120)).await;
         loop {
             let fallible_part = async {
-                let bridges = ccache.get_bridges_v2(&selected_exit.hostname, true).await?;
+                let current_bridges = ccache
+                    .get_bridges_v2(&selected_exit.hostname, false)
+                    .await?;
                 let multiplex = weak_multiplex.upgrade().context("multiplex is dead")?;
-                if let Some(previous_bridges) = previous_bridges.replace(bridges.clone()) {
-                    let new_bridges = bridges
+                for (i, pipe) in multiplex.iter_pipes().enumerate() {
+                    log::debug!("pipe {i}: [{}] {}", pipe.protocol(), pipe.peer_addr());
+                }
+
+                if let Some(previous_bridges) = previous_bridges.replace(current_bridges.clone()) {
+                    // first remove anything that is not in the new bridges
+                    multiplex.retain(|pipe| {
+                        current_bridges
+                            .iter()
+                            .any(|np| np.endpoint.to_string() == pipe.peer_addr())
+                    });
+                    let current_live_pipes: HashSet<String> =
+                        multiplex.iter_pipes().map(|p| p.peer_addr()).collect();
+                    let to_add = current_bridges
+                        .clone()
                         .into_iter()
                         .filter(|br| {
-                            !previous_bridges
-                                .iter()
-                                .any(|pipe| pipe.endpoint == br.endpoint)
+                            !current_live_pipes.contains(&br.endpoint.to_string())
+                                && (!previous_bridges
+                                    .iter()
+                                    .any(|pipe| pipe.endpoint == br.endpoint)
+                                    || br.is_direct)
                         })
                         .collect_vec();
-                    add_bridges(&ctx, &sess_id, &multiplex, &new_bridges).await;
+                    log::debug!(
+                        "** {} bridges that are either not in old, or direct **",
+                        to_add.len()
+                    );
+                    add_bridges(&ctx, &sess_id, &multiplex, &to_add)
+                        .timeout(Duration::from_secs(30))
+                        .await
+                        .context("add_bridges timed out")?;
                 }
                 anyhow::Ok(())
             };

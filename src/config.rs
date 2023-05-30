@@ -6,14 +6,17 @@ use std::{
 };
 
 use crate::fronts::parse_fronts;
+use anyhow::Context;
 use bytes::Bytes;
 use geph4_protocol::binder::client::{CachedBinderClient, DynBinderClient};
-use geph4_protocol::binder::protocol::BinderClient;
+use geph4_protocol::binder::protocol::{BinderClient, Credentials};
 use once_cell::sync::{Lazy, OnceCell};
 
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
+use stdcode::StdcodeSerializeExt;
 use structopt::StructOpt;
+use tmelcrypt::Ed25519SK;
 
 static INIT_CONFIG: OnceCell<Opt> = OnceCell::new();
 
@@ -211,13 +214,28 @@ pub struct AuthOpt {
     /// where to store Geph's credential cache. The default value is "auto", meaning a platform-specific path that Geph gets to pick.
     pub credential_cache: PathBuf,
 
-    #[structopt(long, default_value = "")]
-    /// username
-    pub username: String,
+    #[structopt(subcommand)]
+    pub auth_kind: AuthKind,
+}
 
-    #[structopt(long, default_value = "")]
-    /// password
-    pub password: String,
+#[derive(Debug, StructOpt, Clone, Deserialize, Serialize)]
+#[structopt(name = "auth_kind")]
+pub enum AuthKind {
+    AuthPassword {
+        #[structopt(long, default_value = "")]
+        /// username
+        username: String,
+
+        #[structopt(long, default_value = "")]
+        /// password
+        password: String,
+    },
+
+    AuthKeypair {
+        #[structopt(long, default_value = "")]
+        /// path to file containing private key
+        sk_path: String,
+    },
 }
 
 fn str_to_path(src: &str) -> PathBuf {
@@ -230,7 +248,6 @@ fn str_to_path(src: &str) -> PathBuf {
         PathBuf::from(src)
     }
 }
-
 fn str_to_x25519_pk(src: &str) -> x25519_dalek::PublicKey {
     let raw_bts = hex::decode(src).unwrap();
     let raw_bts: [u8; 32] = raw_bts.as_slice().try_into().unwrap();
@@ -270,16 +287,29 @@ pub fn get_cached_binder_client(
     common_opt: &CommonOpt,
     auth_opt: &AuthOpt,
 ) -> anyhow::Result<CachedBinderClient> {
-    let mut dbpath = auth_opt.credential_cache.clone();
+    let auth_opt = auth_opt.clone();
+
     // create a dbpath based on hashing the username together with the password
-    let quasi_user_id = hex::encode(
-        blake3::keyed_hash(
-            blake3::hash(auth_opt.password.as_bytes()).as_bytes(),
-            auth_opt.username.as_bytes(),
-        )
-        .as_bytes(),
-    );
-    dbpath.push(&quasi_user_id);
+    let mut dbpath = auth_opt.credential_cache.clone();
+
+    let user_cache_key = hex::encode(blake3::hash(&auth_opt.auth_kind.stdcode()).as_bytes());
+
+    let auth_kind = auth_opt.auth_kind;
+    let get_creds = move || match auth_kind.clone() {
+        AuthKind::AuthPassword { username, password } => Credentials::Password {
+            username: username.into(),
+            password: password.into(),
+        },
+        AuthKind::AuthKeypair { sk_path } => {
+            let sk_raw = hex::decode(std::fs::read(sk_path).unwrap()).unwrap();
+            let sk = Ed25519SK::from_bytes(&sk_raw)
+                .context("cannot decode secret key")
+                .unwrap();
+            Credentials::new_keypair(&sk)
+        }
+    };
+
+    dbpath.push(&user_cache_key);
     std::fs::create_dir_all(&dbpath)?;
     let cbc = CachedBinderClient::new(
         {
@@ -314,8 +344,10 @@ pub fn get_cached_binder_client(
             }
         },
         common_opt.get_binder_client(),
-        &auth_opt.username,
-        &auth_opt.password,
+        get_creds,
+        common_opt.binder_mizaru_free.clone(),
+        common_opt.binder_mizaru_plus.clone(),
     );
+
     Ok(cbc)
 }
