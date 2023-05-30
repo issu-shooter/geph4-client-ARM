@@ -4,10 +4,10 @@ An attempt to automatically compile ARM version of geph using Github Actions, fl
 
 ## 迷雾通全平台化的计划
 
-尝试提供ARM架构的迷雾通build，最好能提供flatpak格式的。使用Github Actions编译，一边学习一边做吧。
+尝试提供ARM架构的迷雾通build，以便在各种ARM平台和适用于手机上的Linux系统——PostmarketOS、Mobian上使用。目前使用Github Actions来自动化编译。
 
 ### Roadmap
-1. Build ARM binaries for Geph（done）
+1. Create ARM build of Geph（done）
 2. Flatpak the said ARM binary.
 
 ### 路线图
